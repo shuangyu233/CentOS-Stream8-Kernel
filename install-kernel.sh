@@ -78,40 +78,40 @@ create_tmp_dir() {
 
 # 关键修复：curl | bash 时 stdin 被管道占用，所有交互式读取必须从 /dev/tty 读取
 prompt_read() {
-    local prompt="$1"
-    local varname="$2"
-    local input=""
+    local _prompt="$1"
+    local _varname="$2"
+    local _input=""
 
     if [[ -t 0 ]]; then
-        read -rp "$prompt" input
+        read -rp "$_prompt" _input
     elif [[ -e /dev/tty ]]; then
-        read -rp "$prompt" input < /dev/tty
+        read -rp "$_prompt" _input < /dev/tty
     else
-        input=""
+        _input=""
     fi
 
-    printf -v "$varname" '%s' "$input"
+    printf -v "$_varname" '%s' "$_input"
 }
 
 prompt_yes_no() {
-    local prompt="$1"
-    local default_choice="$2"
-    local varname="$3"
-    local input=""
+    local _prompt="$1"
+    local _default_choice="$2"
+    local _varname="$3"
+    local _input=""
 
     while true; do
-        prompt_read "$prompt" input
-        case "$input" in
+        prompt_read "$_prompt" _input
+        case "$_input" in
             "")
-                printf -v "$varname" '%s' "$default_choice"
+                printf -v "$_varname" '%s' "$_default_choice"
                 return 0
                 ;;
-            [Yy])
-                printf -v "$varname" '%s' "y"
+            [Yy]|[Yy][Ee][Ss])
+                printf -v "$_varname" '%s' "y"
                 return 0
                 ;;
-            [Nn])
-                printf -v "$varname" '%s' "n"
+            [Nn]|[Nn][Oo])
+                printf -v "$_varname" '%s' "n"
                 return 0
                 ;;
             *)
@@ -124,7 +124,7 @@ prompt_yes_no() {
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         error "此脚本需要 root 权限运行"
-        error "请使用: sudo bash $0 $*"
+        error "请使用: sudo bash $0"
         error "或: curl -fsSL <URL> | sudo bash"
         exit 1
     fi
@@ -150,7 +150,7 @@ check_system() {
 
 check_dependencies() {
     local missing=()
-    for cmd in curl rpm; do
+    for cmd in curl rpm awk grep sed sha256sum find df mktemp; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -163,13 +163,13 @@ check_dependencies() {
 
 check_disk_space() {
     local tmp_avail
-    tmp_avail=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M' || echo "")
+    tmp_avail=$(df -m /tmp 2>/dev/null | awk 'NR==2{print $4}' || echo "")
     if [[ -n "$tmp_avail" ]] && [[ "$tmp_avail" =~ ^[0-9]+$ ]] && [[ "$tmp_avail" -lt 500 ]]; then
         warn "/tmp 可用空间不足 500MB（当前: ${tmp_avail}MB），下载可能失败"
     fi
 
     local boot_avail
-    boot_avail=$(df -BM /boot 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M' || echo "")
+    boot_avail=$(df -m /boot 2>/dev/null | awk 'NR==2{print $4}' || echo "")
     if [[ -n "$boot_avail" ]] && [[ "$boot_avail" =~ ^[0-9]+$ ]] && [[ "$boot_avail" -lt 300 ]]; then
         warn "/boot 可用空间不足 300MB（当前: ${boot_avail}MB），内核安装可能失败"
     fi
@@ -183,6 +183,11 @@ import_elrepo_key() {
     fi
 
     step "导入 ELRepo GPG 密钥..."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        info "[DRY-RUN] 模拟导入 ELRepo GPG 密钥: ${ELREPO_KEY_URL}"
+        return 0
+    fi
+
     if rpm --import "${ELREPO_KEY_URL}" 2>/dev/null; then
         info "ELRepo GPG 密钥导入成功"
     else
@@ -396,17 +401,20 @@ prepare_rpms() {
     total=$(echo "$files" | wc -l)
     local count=0
 
+    local curl_opts=("-fL" "--connect-timeout" "${CURL_CONNECT_TIMEOUT}" "--max-time" "${CURL_MAX_TIME}" "--retry" "${CURL_RETRY}")
+    if [[ -t 1 ]]; then
+        curl_opts+=("--progress-bar")
+    else
+        curl_opts+=("-sS")
+    fi
+
     while IFS= read -r url; do
         [[ -z "$url" ]] && continue
         count=$((count + 1))
         local filename
         filename=$(basename "$url")
         echo -e "  [${count}/${total}] 下载 ${filename}..."
-        if ! curl -fL --progress-bar \
-                --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
-                --max-time "${CURL_MAX_TIME}" \
-                --retry "${CURL_RETRY}" \
-                -o "${RPM_DIR}/${filename}" "$url"; then
+        if ! curl "${curl_opts[@]}" -o "${RPM_DIR}/${filename}" "$url"; then
             die "下载失败: ${filename}，请检查网络连接后重试"
         fi
 
@@ -596,6 +604,17 @@ install_rpms() {
         exit 0
     fi
 
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo ""
+        info "[DRY-RUN] 模拟安装以下包 (跳过实际安装):"
+        for rpm_file in "${ordered_rpms[@]}"; do
+            echo "  -> $(basename "$rpm_file")"
+        done
+        echo ""
+        info "[DRY-RUN] kernel-ml-${version} 模拟安装完成！"
+        return 0
+    fi
+
     # 使用 dnf 或 yum 安装（一次性传入所有包，由包管理器处理依赖顺序）
     echo ""
     if command -v dnf &>/dev/null; then
@@ -692,13 +711,40 @@ on_interrupt() {
 
 # ==================== 主流程 ====================
 main() {
-    check_root "$@"
+    local version=""
+
+    # 解析参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -h|--help)
+                echo "用法: $0 [--dry-run] [版本号]"
+                echo "  --dry-run   模拟执行，不修改系统"
+                exit 0
+                ;;
+            -*)
+                error "未知参数: $1"
+                exit 1
+                ;;
+            *)
+                version="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        warn "已启用 --dry-run 模式，不会对系统进行实际修改"
+    fi
+
+    check_root
     check_system
     check_dependencies
     check_disk_space
     import_elrepo_key
-
-    local version="${1:-}"
 
     if [[ -n "$version" ]]; then
         # 命令行指定版本号：校验格式
@@ -717,7 +763,10 @@ main() {
     prepare_rpms "$SELECTED_VERSION"
     verify_rpms "$RPM_DIR"
     install_rpms "$RPM_DIR" "$SELECTED_VERSION"
-    post_install "$SELECTED_VERSION"
+    
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        post_install "$SELECTED_VERSION"
+    fi
 
     # 清理下载的临时文件
     cleanup
