@@ -22,7 +22,9 @@ REPO_BRANCH="main"
 GITHUB_RAW="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
 ELREPO_DIR="elrepo"
-TMP_DIR="/tmp/kernel-ml-install"
+TMP_DIR_BASE="/tmp/kernel-ml-install"
+TMP_DIR=""
+TMP_CREATED=0
 RPM_DIR=""
 SELECTED_VERSION=""
 
@@ -65,6 +67,15 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
 die()     { error "$@"; exit 1; }
 
+create_tmp_dir() {
+    if [[ "${TMP_CREATED:-0}" -eq 1 ]] && [[ -n "${TMP_DIR:-}" ]] && [[ -d "${TMP_DIR}" ]]; then
+        return 0
+    fi
+
+    TMP_DIR=$(mktemp -d "${TMP_DIR_BASE}.XXXXXX") || die "创建临时目录失败"
+    TMP_CREATED=1
+}
+
 # 关键修复：curl | bash 时 stdin 被管道占用，所有交互式读取必须从 /dev/tty 读取
 prompt_read() {
     local prompt="$1"
@@ -80,6 +91,34 @@ prompt_read() {
     fi
 
     printf -v "$varname" '%s' "$input"
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default_choice="$2"
+    local varname="$3"
+    local input=""
+
+    while true; do
+        prompt_read "$prompt" input
+        case "$input" in
+            "")
+                printf -v "$varname" '%s' "$default_choice"
+                return 0
+                ;;
+            [Yy])
+                printf -v "$varname" '%s' "y"
+                return 0
+                ;;
+            [Nn])
+                printf -v "$varname" '%s' "n"
+                return 0
+                ;;
+            *)
+                warn "输入无效，请输入 y 或 n（或直接回车使用默认值）"
+                ;;
+        esac
+    done
 }
 
 check_root() {
@@ -102,8 +141,8 @@ check_system() {
         warn "当前系统: $release"
         warn "此脚本设计用于 CentOS Stream 8，其他版本可能不兼容"
         local confirm=""
-        prompt_read "是否继续？(y/N): " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+        prompt_yes_no "是否继续？(y/N): " "n" confirm
+        [[ "$confirm" == "y" ]] || exit 0
     fi
 
     info "系统检查通过: $release"
@@ -127,6 +166,12 @@ check_disk_space() {
     tmp_avail=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M' || echo "")
     if [[ -n "$tmp_avail" ]] && [[ "$tmp_avail" =~ ^[0-9]+$ ]] && [[ "$tmp_avail" -lt 500 ]]; then
         warn "/tmp 可用空间不足 500MB（当前: ${tmp_avail}MB），下载可能失败"
+    fi
+
+    local boot_avail
+    boot_avail=$(df -BM /boot 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M' || echo "")
+    if [[ -n "$boot_avail" ]] && [[ "$boot_avail" =~ ^[0-9]+$ ]] && [[ "$boot_avail" -lt 300 ]]; then
+        warn "/boot 可用空间不足 300MB（当前: ${boot_avail}MB），内核安装可能失败"
     fi
 }
 
@@ -164,7 +209,7 @@ get_local_versions() {
 
 get_remote_versions() {
     local response
-    response=$(curl -sL \
+    response=$(curl -fsSL \
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
@@ -297,12 +342,13 @@ prepare_rpms() {
 
     # 从 GitHub 下载
     step "从 GitHub 下载 RPM 包..."
+    create_tmp_dir
     mkdir -p "${TMP_DIR}/${version}"
     RPM_DIR="${TMP_DIR}/${version}"
 
     # 获取文件列表
     local response=""
-    response=$(curl -sL \
+    response=$(curl -fsSL \
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
@@ -356,7 +402,7 @@ prepare_rpms() {
         local filename
         filename=$(basename "$url")
         echo -e "  [${count}/${total}] 下载 ${filename}..."
-        if ! curl -L --progress-bar \
+        if ! curl -fL --progress-bar \
                 --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
                 --max-time "${CURL_MAX_TIME}" \
                 --retry "${CURL_RETRY}" \
@@ -374,7 +420,7 @@ prepare_rpms() {
     # 下载 SHA256SUMS 校验文件
     local sha256_url="${GITHUB_RAW}/${ELREPO_DIR}/${version}/SHA256SUMS"
     echo -e "  下载 SHA256SUMS..."
-    if curl -sL \
+    if curl -fsSL \
             --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
             --max-time 30 \
             --retry "${CURL_RETRY}" \
@@ -491,8 +537,8 @@ install_rpms() {
     if [[ "$installed_core_version" == "$version" ]]; then
         warn "kernel-ml-${version} 已经安装"
         local confirm=""
-        prompt_read "是否重新安装？(y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        prompt_yes_no "是否重新安装？(y/N): " "n" confirm
+        if [[ "$confirm" != "y" ]]; then
             info "取消安装"
             exit 0
         fi
@@ -544,9 +590,8 @@ install_rpms() {
     echo ""
 
     local confirm=""
-    prompt_read "确认安装？(Y/n): " confirm
-    # 空值（包括管道模式无终端）默认为 Yes
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+    prompt_yes_no "确认安装？(Y/n): " "y" confirm
+    if [[ "$confirm" == "n" ]]; then
         info "取消安装"
         exit 0
     fi
@@ -556,12 +601,28 @@ install_rpms() {
     if command -v dnf &>/dev/null; then
         step "使用 dnf 安装（自动处理依赖）..."
         if ! dnf install -y "${ordered_rpms[@]}"; then
-            die "dnf 安装失败"
+            warn "dnf 安装失败，尝试回退到 rpm 本地顺序安装..."
+            for rpm_file in "${ordered_rpms[@]}"; do
+                local basename_file
+                basename_file=$(basename "$rpm_file")
+                echo -e "  安装 ${basename_file}..."
+                if ! rpm -ivh "$rpm_file"; then
+                    die "回退安装失败: ${basename_file}"
+                fi
+            done
         fi
     elif command -v yum &>/dev/null; then
         step "使用 yum 安装（自动处理依赖）..."
         if ! yum localinstall -y "${ordered_rpms[@]}"; then
-            die "yum 安装失败"
+            warn "yum 安装失败，尝试回退到 rpm 本地顺序安装..."
+            for rpm_file in "${ordered_rpms[@]}"; do
+                local basename_file
+                basename_file=$(basename "$rpm_file")
+                echo -e "  安装 ${basename_file}..."
+                if ! rpm -ivh "$rpm_file"; then
+                    die "回退安装失败: ${basename_file}"
+                fi
+            done
         fi
     else
         step "使用 rpm 按顺序安装..."
@@ -613,9 +674,20 @@ post_install() {
 
 # ==================== 清理临时文件 ====================
 cleanup() {
-    if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
-        rm -rf "$TMP_DIR"
+    if [[ "${TMP_CREATED:-0}" -eq 1 ]] \
+       && [[ -n "${TMP_DIR:-}" ]] \
+       && [[ -d "$TMP_DIR" ]] \
+       && [[ "$TMP_DIR" == ${TMP_DIR_BASE}.* ]]; then
+        rm -rf "$TMP_DIR" || true
+        TMP_CREATED=0
     fi
+}
+
+on_interrupt() {
+    echo ""
+    warn "检测到中断信号，正在清理临时文件..."
+    cleanup
+    exit 130
 }
 
 # ==================== 主流程 ====================
@@ -651,5 +723,6 @@ main() {
     cleanup
 }
 
+trap on_interrupt INT TERM
 trap cleanup EXIT
 main "$@"
