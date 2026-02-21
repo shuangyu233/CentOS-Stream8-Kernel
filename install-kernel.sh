@@ -68,6 +68,16 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
 die()     { error "$@"; exit 1; }
 
+# 获取脚本所在目录（管道执行时返回空字符串）
+get_script_dir() {
+    if [[ -n "${BASH_SOURCE[0]:-}" \
+       && "${BASH_SOURCE[0]}" != "bash" \
+       && "${BASH_SOURCE[0]}" != "-bash" ]]; then
+        # 用子 shell 避免改变当前进程的工作目录
+        ( cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd ) || true
+    fi
+}
+
 create_tmp_dir() {
     if [[ "${TMP_CREATED:-0}" -eq 1 ]] && [[ -n "${TMP_DIR:-}" ]] && [[ -d "${TMP_DIR}" ]]; then
         return 0
@@ -77,42 +87,44 @@ create_tmp_dir() {
     TMP_CREATED=1
 }
 
-# 关键修复：curl | bash 时 stdin 被管道占用，所有交互式读取必须从 /dev/tty 读取
+# prompt_read: 将提示符写到终端，从终端读取一行输入，结果输出到 stdout
+# 用法: var=$(prompt_read "提示")
+# curl | bash 时 stdin 是管道，必须从 /dev/tty 读取用户输入；提示符写到 /dev/tty 避免被 $() 吃掉
 prompt_read() {
-    local _prompt="$1"
-    local _varname="$2"
-    local _input=""
+    local __prompt__="$1"
+    local __buf__=""
 
     if [[ -t 0 ]]; then
-        read -rp "$_prompt" _input
+        # 正常终端模式
+        read -rp "$__prompt__" __buf__
     elif [[ -e /dev/tty ]]; then
-        read -rp "$_prompt" _input < /dev/tty
-    else
-        _input=""
+        # 管道模式（curl | bash）：提示符送到 /dev/tty，从 /dev/tty 读输入
+        printf '%s' "$__prompt__" >/dev/tty
+        IFS= read -r __buf__ </dev/tty
     fi
-
-    printf -v "$_varname" '%s' "$_input"
+    # 将结果输出到 stdout，由调用方用 $() 捕获
+    printf '%s' "$__buf__"
 }
 
 prompt_yes_no() {
-    local _prompt="$1"
-    local _default_choice="$2"
-    local _varname="$3"
-    local _input=""
+    local __prompt__="$1"
+    local __default__="$2"
+    local __varname__="$3"
+    local __input__
 
     while true; do
-        prompt_read "$_prompt" _input
-        case "$_input" in
+        __input__=$(prompt_read "$__prompt__")
+        case "$__input__" in
             "")
-                printf -v "$_varname" '%s' "$_default_choice"
+                printf -v "$__varname__" '%s' "$__default__"
                 return 0
                 ;;
             [Yy]|[Yy][Ee][Ss])
-                printf -v "$_varname" '%s' "y"
+                printf -v "$__varname__" '%s' "y"
                 return 0
                 ;;
             [Nn]|[Nn][Oo])
-                printf -v "$_varname" '%s' "n"
+                printf -v "$__varname__" '%s' "n"
                 return 0
                 ;;
             *)
@@ -141,7 +153,7 @@ check_system() {
     if ! echo "$release" | grep -qiE '(centos|red hat).*(stream )?8'; then
         warn "当前系统: $release"
         warn "此脚本设计用于 CentOS Stream 8，其他版本可能不兼容"
-        local confirm=""
+        local confirm
         prompt_yes_no "是否继续？(y/N): " "n" confirm
         [[ "$confirm" == "y" ]] || exit 0
     fi
@@ -198,14 +210,9 @@ import_elrepo_key() {
 
 # ==================== 获取可用版本 ====================
 get_local_versions() {
-    local script_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && "${BASH_SOURCE[0]}" != "-bash" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || true
-    fi
-
-    if [[ -z "$script_dir" ]]; then
-        return 0
-    fi
+    local script_dir
+    script_dir=$(get_script_dir)
+    [[ -z "$script_dir" ]] && return 0
 
     local elrepo_path="${script_dir}/${ELREPO_DIR}"
     if [[ -d "$elrepo_path" ]]; then
@@ -295,21 +302,21 @@ select_version() {
     local i=1
     for v in "${versions[@]}"; do
         echo -e "  ${GREEN}${i})${NC} kernel-ml-${v}"
-        ((i++))
+        i=$((i + 1))
     done
     echo ""
 
-    # 重试循环：输入无效时重新提示
+    # 重试循环：输入无效时重新提示（最多 5 次）
     local max_attempts=5
     local attempt=0
     while true; do
-        ((attempt++))
+        attempt=$((attempt + 1))
         if [[ $attempt -gt $max_attempts ]]; then
             die "输入错误次数过多，退出"
         fi
 
-        local choice=""
-        prompt_read "请选择版本 [1-${#versions[@]}]: " choice
+        local choice
+        choice=$(prompt_read "请选择版本 [1-${#versions[@]}]: ")
 
         # 无终端输入时默认选最新版本
         if [[ -z "$choice" ]]; then
@@ -331,12 +338,9 @@ select_version() {
 prepare_rpms() {
     local version="$1"
 
-    # 检查本地是否已有文件（仅在非管道模式下）
-    local script_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && "${BASH_SOURCE[0]}" != "-bash" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || true
-    fi
-
+    # 优先使用本地文件（仅在非管道模式下有效）
+    local script_dir
+    script_dir=$(get_script_dir)
     if [[ -n "$script_dir" ]]; then
         local local_path="${script_dir}/${ELREPO_DIR}/${version}"
         if [[ -d "$local_path" ]] && ls "$local_path"/*.rpm &>/dev/null; then
@@ -541,11 +545,11 @@ install_rpms() {
     echo ""
 
     # 检查是否已安装相同版本（仅比较 Version，不绑定 Release）
-    local installed_core_version=""
+    local installed_core_version
     installed_core_version=$(rpm -q --qf '%{VERSION}\n' kernel-ml-core 2>/dev/null | head -1 || true)
     if [[ "$installed_core_version" == "$version" ]]; then
         warn "kernel-ml-${version} 已经安装"
-        local confirm=""
+        local confirm
         prompt_yes_no "是否重新安装？(y/N): " "n" confirm
         if [[ "$confirm" != "y" ]]; then
             info "取消安装"
@@ -572,10 +576,10 @@ install_rpms() {
 
     # 检查核心包是否存在
     local has_core=false
-    for rpm_file in "${ordered_rpms[@]}"; do
-        local bname
-        bname=$(basename "$rpm_file")
-        if [[ "$bname" == kernel-ml-core-* ]]; then
+    local _chk_bname
+    for _chk_f in "${ordered_rpms[@]}"; do
+        _chk_bname=$(basename "$_chk_f")
+        if [[ "$_chk_bname" == kernel-ml-core-* ]]; then
             has_core=true
             break
         fi
@@ -598,7 +602,7 @@ install_rpms() {
     done
     echo ""
 
-    local confirm=""
+    local confirm
     prompt_yes_no "确认安装？(Y/n): " "y" confirm
     if [[ "$confirm" == "n" ]]; then
         info "取消安装"
@@ -608,52 +612,42 @@ install_rpms() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo ""
         info "[DRY-RUN] 模拟安装以下包 (跳过实际安装):"
-        for rpm_file in "${ordered_rpms[@]}"; do
-            echo "  -> $(basename "$rpm_file")"
+        local _dry_f
+        for _dry_f in "${ordered_rpms[@]}"; do
+            echo "  -> $(basename "$_dry_f")"
         done
         echo ""
         info "[DRY-RUN] kernel-ml-${version} 模拟安装完成！"
         return 0
     fi
 
-    # 使用 dnf 或 yum 安装（一次性传入所有包，由包管理器处理依赖顺序）
+    # 按顺序用 rpm -ivh 逐包安装（dnf/yum 不可用或失败时的回退方案）
+    _rpm_sequential_install() {
+        local _f _b
+        for _f in "$@"; do
+            _b=$(basename "$_f")
+            echo -e "  安装 ${_b}..."
+            rpm -ivh "$_f" || die "rpm 安装失败: ${_b}，可尝试手动运行: rpm -ivh --nodeps ${_b}"
+        done
+    }
+
+    # 优先使用高级包管理器（自动处理依赖），失败时回退到 rpm 直接安装
     echo ""
     if command -v dnf &>/dev/null; then
         step "使用 dnf 安装（自动处理依赖）..."
         if ! dnf install -y "${ordered_rpms[@]}"; then
-            warn "dnf 安装失败，尝试回退到 rpm 本地顺序安装..."
-            for rpm_file in "${ordered_rpms[@]}"; do
-                local basename_file
-                basename_file=$(basename "$rpm_file")
-                echo -e "  安装 ${basename_file}..."
-                if ! rpm -ivh "$rpm_file"; then
-                    die "回退安装失败: ${basename_file}"
-                fi
-            done
+            warn "dnf 安装失败，回退到 rpm 顺序安装..."
+            _rpm_sequential_install "${ordered_rpms[@]}"
         fi
     elif command -v yum &>/dev/null; then
         step "使用 yum 安装（自动处理依赖）..."
         if ! yum localinstall -y "${ordered_rpms[@]}"; then
-            warn "yum 安装失败，尝试回退到 rpm 本地顺序安装..."
-            for rpm_file in "${ordered_rpms[@]}"; do
-                local basename_file
-                basename_file=$(basename "$rpm_file")
-                echo -e "  安装 ${basename_file}..."
-                if ! rpm -ivh "$rpm_file"; then
-                    die "回退安装失败: ${basename_file}"
-                fi
-            done
+            warn "yum 安装失败，回退到 rpm 顺序安装..."
+            _rpm_sequential_install "${ordered_rpms[@]}"
         fi
     else
-        step "使用 rpm 按顺序安装..."
-        for rpm_file in "${ordered_rpms[@]}"; do
-            local basename_file
-            basename_file=$(basename "$rpm_file")
-            echo -e "  安装 ${basename_file}..."
-            if ! rpm -ivh "$rpm_file"; then
-                die "安装失败: ${basename_file}，尝试: rpm -ivh --nodeps ${basename_file}"
-            fi
-        done
+        step "使用 rpm 顺序安装..."
+        _rpm_sequential_install "${ordered_rpms[@]}"
     fi
 
     echo ""
