@@ -27,6 +27,7 @@ TMP_DIR=""
 TMP_CREATED=0
 RPM_DIR=""
 SELECTED_VERSION=""
+DRY_RUN=0
 
 # ELRepo GPG Key IDs（兼容旧/新签名密钥）
 ELREPO_KEY_IDS_REGEX="(baadae52|eaa31d4a)"
