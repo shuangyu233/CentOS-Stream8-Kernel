@@ -13,7 +13,7 @@
 #     curl -fsSL https://raw.githubusercontent.com/shuangyu233/CentOS-Stream8-Kernel/main/install-kernel.sh | sudo bash -s 6.18.10
 #
 
-set -euo pipefail
+set -uo pipefail
 
 # ==================== 配置 ====================
 REPO_OWNER="shuangyu233"
@@ -26,8 +26,8 @@ TMP_DIR="/tmp/kernel-ml-install"
 RPM_DIR=""
 SELECTED_VERSION=""
 
-# ELRepo GPG Key ID
-ELREPO_KEY_ID="baadae52"
+# ELRepo GPG Key IDs（兼容旧/新签名密钥）
+ELREPO_KEY_IDS_REGEX="(baadae52|eaa31d4a)"
 ELREPO_KEY_URL="https://www.elrepo.org/RPM-GPG-KEY-elrepo.org"
 
 # curl 超时设置（秒）
@@ -63,6 +63,7 @@ info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
+die()     { error "$@"; exit 1; }
 
 # 关键修复：curl | bash 时 stdin 被管道占用，所有交互式读取必须从 /dev/tty 读取
 prompt_read() {
@@ -71,13 +72,10 @@ prompt_read() {
     local input=""
 
     if [[ -t 0 ]]; then
-        # stdin 是终端，直接读取
         read -rp "$prompt" input
     elif [[ -e /dev/tty ]]; then
-        # stdin 被管道占用（curl | bash），从 /dev/tty 读取
         read -rp "$prompt" input < /dev/tty
     else
-        # 无可用终端，返回空值
         input=""
     fi
 
@@ -95,8 +93,7 @@ check_root() {
 
 check_system() {
     if [[ ! -f /etc/redhat-release ]]; then
-        error "此脚本仅适用于 CentOS/RHEL 系统"
-        exit 1
+        die "此脚本仅适用于 CentOS/RHEL 系统"
     fi
 
     local release
@@ -121,24 +118,21 @@ check_dependencies() {
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        error "缺少必要的工具: ${missing[*]}"
-        exit 1
+        die "缺少必要的工具: ${missing[*]}"
     fi
 }
 
 check_disk_space() {
-    # 需要约 300MB 临时空间 + 安装空间
     local tmp_avail
-    tmp_avail=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M')
-    if [[ -n "$tmp_avail" && "$tmp_avail" -lt 500 ]]; then
+    tmp_avail=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'M' || echo "")
+    if [[ -n "$tmp_avail" ]] && [[ "$tmp_avail" =~ ^[0-9]+$ ]] && [[ "$tmp_avail" -lt 500 ]]; then
         warn "/tmp 可用空间不足 500MB（当前: ${tmp_avail}MB），下载可能失败"
     fi
 }
 
 # ==================== GPG 密钥管理 ====================
 import_elrepo_key() {
-    # 检查是否已导入 ELRepo GPG 密钥
-    if rpm -qa gpg-pubkey* 2>/dev/null | grep -qi "${ELREPO_KEY_ID}"; then
+    if rpm -qa gpg-pubkey* 2>/dev/null | grep -Eqi "${ELREPO_KEY_IDS_REGEX}" 2>/dev/null; then
         info "ELRepo GPG 密钥已导入"
         return 0
     fi
@@ -153,10 +147,9 @@ import_elrepo_key() {
 
 # ==================== 获取可用版本 ====================
 get_local_versions() {
-    # 在 curl | bash 模式下 BASH_SOURCE[0] 可能为空
     local script_dir=""
     if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && "${BASH_SOURCE[0]}" != "-bash" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || true
     fi
 
     if [[ -z "$script_dir" ]]; then
@@ -165,7 +158,7 @@ get_local_versions() {
 
     local elrepo_path="${script_dir}/${ELREPO_DIR}"
     if [[ -d "$elrepo_path" ]]; then
-        find "$elrepo_path" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -V
+        find "$elrepo_path" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -V || true
     fi
 }
 
@@ -175,26 +168,37 @@ get_remote_versions() {
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
-        "${GITHUB_API}/contents/${ELREPO_DIR}?ref=${REPO_BRANCH}" 2>/dev/null) || return 1
+        "${GITHUB_API}/contents/${ELREPO_DIR}?ref=${REPO_BRANCH}" 2>/dev/null) || {
+        error "无法连接到 GitHub"
+        return 1
+    }
 
-    # 检查 API 限流
-    if echo "$response" | grep -q '"message".*rate limit'; then
+    if echo "$response" | grep -q '"message".*rate limit' 2>/dev/null; then
         error "GitHub API 请求频率超限，请稍后重试"
         return 1
     fi
 
-    echo "$response" \
-        | grep '"name"' \
-        | sed 's/.*"name": "\(.*\)".*/\1/' \
-        | grep -E '^[0-9]+\.' \
-        | sort -V
+    # 安全提取版本号：每一步都防止 grep 无匹配导致管道失败
+    local versions
+    versions=$(echo "$response" \
+        | grep '"name"' 2>/dev/null \
+        | sed 's/.*"name": "\(.*\)".*/\1/' 2>/dev/null \
+        | grep -E '^[0-9]+\.' 2>/dev/null \
+        | sort -V 2>/dev/null) || true
+
+    if [[ -z "$versions" ]]; then
+        error "从 GitHub 获取版本列表返回为空"
+        return 1
+    fi
+
+    echo "$versions"
 }
 
 get_versions() {
     local versions=""
 
     # 优先使用本地目录
-    versions=$(get_local_versions)
+    versions=$(get_local_versions) || true
     if [[ -n "$versions" ]]; then
         echo "$versions"
         return 0
@@ -216,7 +220,7 @@ get_versions() {
 # ==================== 版本选择 ====================
 select_version() {
     local versions_str
-    versions_str=$(get_versions) || exit 1
+    versions_str=$(get_versions) || die "获取版本列表失败"
 
     local versions=()
     while IFS= read -r v; do
@@ -224,8 +228,7 @@ select_version() {
     done <<< "$versions_str"
 
     if [[ ${#versions[@]} -eq 0 ]]; then
-        error "没有找到可用的内核版本"
-        exit 1
+        die "没有找到可用的内核版本"
     fi
 
     echo ""
@@ -245,22 +248,32 @@ select_version() {
     done
     echo ""
 
-    local choice=""
-    prompt_read "请选择版本 [1-${#versions[@]}]: " choice
+    # 重试循环：输入无效时重新提示
+    local max_attempts=5
+    local attempt=0
+    while true; do
+        ((attempt++))
+        if [[ $attempt -gt $max_attempts ]]; then
+            die "输入错误次数过多，退出"
+        fi
 
-    # 输入为空时（无终端），默认选最新版本
-    if [[ -z "$choice" ]]; then
-        choice="${#versions[@]}"
-        warn "无法读取输入，自动选择最新版本"
-    fi
+        local choice=""
+        prompt_read "请选择版本 [1-${#versions[@]}]: " choice
 
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#versions[@]} ]]; then
-        error "无效的选择: $choice"
-        exit 1
-    fi
+        # 无终端输入时默认选最新版本
+        if [[ -z "$choice" ]]; then
+            choice="${#versions[@]}"
+            warn "无法读取输入，自动选择最新版本"
+        fi
 
-    SELECTED_VERSION="${versions[$((choice - 1))]}"
-    info "已选择版本: kernel-ml-${SELECTED_VERSION}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#versions[@]} ]]; then
+            SELECTED_VERSION="${versions[$((choice - 1))]}"
+            info "已选择版本: kernel-ml-${SELECTED_VERSION}"
+            return 0
+        fi
+
+        warn "无效的选择: ${choice}，请输入 1 到 ${#versions[@]} 之间的数字"
+    done
 }
 
 # ==================== 下载/定位 RPM 包 ====================
@@ -270,7 +283,7 @@ prepare_rpms() {
     # 检查本地是否已有文件（仅在非管道模式下）
     local script_dir=""
     if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && "${BASH_SOURCE[0]}" != "-bash" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || true
     fi
 
     if [[ -n "$script_dir" ]]; then
@@ -288,25 +301,49 @@ prepare_rpms() {
     RPM_DIR="${TMP_DIR}/${version}"
 
     # 获取文件列表
-    local response
+    local response=""
     response=$(curl -sL \
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
         "${GITHUB_API}/contents/${ELREPO_DIR}/${version}?ref=${REPO_BRANCH}" 2>/dev/null) || {
-        error "无法连接到 GitHub，请检查网络"
-        exit 1
+        die "无法连接到 GitHub，请检查网络"
     }
 
-    local files
+    if [[ -z "$response" ]]; then
+        die "GitHub API 返回为空，请检查网络连接"
+    fi
+
+    # 提取 RPM 文件的下载 URL（防止 grep 无匹配导致管道失败）
+    local files=""
     files=$(echo "$response" \
-        | grep '"download_url"' \
-        | sed 's/.*"download_url": "\(.*\)".*/\1/' \
-        | grep '\.rpm$')
+        | grep -v '"download_url": null' 2>/dev/null \
+        | grep '"download_url"' 2>/dev/null \
+        | sed 's/.*"download_url": "\(.*\)".*/\1/' 2>/dev/null \
+        | grep '\.rpm$' 2>/dev/null) || true
 
     if [[ -z "$files" ]]; then
-        error "无法获取版本 ${version} 的文件列表，请确认版本号是否正确"
-        exit 1
+        # 备用方案：从文件名列表构建 raw URL
+        warn "无法从 API 获取下载链接，尝试备用下载方式..."
+        local names=""
+        names=$(echo "$response" \
+            | grep '"name"' 2>/dev/null \
+            | sed 's/.*"name": "\(.*\)".*/\1/' 2>/dev/null \
+            | grep '\.rpm$' 2>/dev/null) || true
+
+        if [[ -n "$names" ]]; then
+            files=""
+            while IFS= read -r name; do
+                if [[ -n "$files" ]]; then
+                    files="${files}"$'\n'
+                fi
+                files="${files}${GITHUB_RAW}/${ELREPO_DIR}/${version}/${name}"
+            done <<< "$names"
+        fi
+    fi
+
+    if [[ -z "$files" ]]; then
+        die "无法获取版本 ${version} 的文件列表，请确认版本号是否正确"
     fi
 
     local total
@@ -314,7 +351,8 @@ prepare_rpms() {
     local count=0
 
     while IFS= read -r url; do
-        ((count++))
+        [[ -z "$url" ]] && continue
+        count=$((count + 1))
         local filename
         filename=$(basename "$url")
         echo -e "  [${count}/${total}] 下载 ${filename}..."
@@ -323,19 +361,15 @@ prepare_rpms() {
                 --max-time "${CURL_MAX_TIME}" \
                 --retry "${CURL_RETRY}" \
                 -o "${RPM_DIR}/${filename}" "$url"; then
-            error "下载失败: ${filename}"
-            error "请检查网络连接后重试"
-            exit 1
+            die "下载失败: ${filename}，请检查网络连接后重试"
         fi
 
-        # 简单校验：文件大小不为 0
         if [[ ! -s "${RPM_DIR}/${filename}" ]]; then
-            error "下载的文件为空: ${filename}"
-            exit 1
+            die "下载的文件为空: ${filename}"
         fi
     done <<< "$files"
 
-    info "所有 RPM 包下载完成 (共 ${total} 个)"
+    info "所有 RPM 包下载完成 (共 ${count} 个)"
 
     # 下载 SHA256SUMS 校验文件
     local sha256_url="${GITHUB_RAW}/${ELREPO_DIR}/${version}/SHA256SUMS"
@@ -364,7 +398,7 @@ verify_rpms() {
         local sha256_failed=0
         local sha256_checked=0
 
-        pushd "$rpm_dir" > /dev/null
+        pushd "$rpm_dir" > /dev/null || die "无法进入目录: $rpm_dir"
         while IFS= read -r line; do
             # 跳过空行和注释
             [[ -z "$line" || "$line" == \#* ]] && continue
@@ -375,13 +409,13 @@ verify_rpms() {
 
             if [[ ! -f "$file_name" ]]; then
                 echo -e "  ${RED}✗${NC} ${file_name} (文件不存在)"
-                ((sha256_failed++))
+                sha256_failed=$((sha256_failed + 1))
                 continue
             fi
 
             local actual_hash
             actual_hash=$(sha256sum "$file_name" | awk '{print $1}')
-            ((sha256_checked++))
+            sha256_checked=$((sha256_checked + 1))
 
             if [[ "$actual_hash" == "$expected_hash" ]]; then
                 echo -e "  ${GREEN}✓${NC} ${file_name} (SHA256)"
@@ -389,15 +423,13 @@ verify_rpms() {
                 echo -e "  ${RED}✗${NC} ${file_name} (SHA256 不匹配)"
                 echo -e "    预期: ${expected_hash}"
                 echo -e "    实际: ${actual_hash}"
-                ((sha256_failed++))
+                sha256_failed=$((sha256_failed + 1))
             fi
         done < "$sha256_file"
-        popd > /dev/null
+        popd > /dev/null || true
 
         if [[ $sha256_failed -gt 0 ]]; then
-            error "${sha256_failed} 个文件 SHA256 校验失败，中止安装"
-            error "文件可能已损坏或被篡改，请重新下载"
-            exit 1
+            die "${sha256_failed} 个文件 SHA256 校验失败，文件可能已损坏或被篡改，请重新下载"
         fi
 
         if [[ $sha256_checked -gt 0 ]]; then
@@ -416,7 +448,7 @@ verify_rpms() {
     local total=0
     for rpm_file in "$rpm_dir"/*.rpm; do
         [[ -f "$rpm_file" ]] || continue
-        ((total++))
+        total=$((total + 1))
         local basename_file
         basename_file=$(basename "$rpm_file")
 
@@ -430,19 +462,16 @@ verify_rpms() {
             fi
         else
             echo -e "  ${RED}✗${NC} ${basename_file} (RPM 摘要校验失败)"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     done
 
     if [[ $total -eq 0 ]]; then
-        error "目录中没有找到 RPM 包"
-        exit 1
+        die "目录中没有找到 RPM 包"
     fi
 
     if [[ $failed -gt 0 ]]; then
-        error "${failed}/${total} 个包 RPM 校验失败，中止安装"
-        error "包文件可能已损坏，请重新下载"
-        exit 1
+        die "${failed}/${total} 个包 RPM 校验失败，包文件可能已损坏，请重新下载"
     fi
 
     info "所有 RPM 包校验通过 (${total} 个)"
@@ -456,8 +485,10 @@ install_rpms() {
     step "准备安装 kernel-ml-${version}..."
     echo ""
 
-    # 检查是否已安装相同版本
-    if rpm -q "kernel-ml-core-${version}-1.el8.elrepo" &>/dev/null; then
+    # 检查是否已安装相同版本（仅比较 Version，不绑定 Release）
+    local installed_core_version=""
+    installed_core_version=$(rpm -q --qf '%{VERSION}\n' kernel-ml-core 2>/dev/null | head -1 || true)
+    if [[ "$installed_core_version" == "$version" ]]; then
         warn "kernel-ml-${version} 已经安装"
         local confirm=""
         prompt_read "是否重新安装？(y/N): " confirm
@@ -481,22 +512,22 @@ install_rpms() {
     done
 
     if [[ ${#ordered_rpms[@]} -eq 0 ]]; then
-        error "没有找到可安装的 RPM 包"
-        exit 1
+        die "没有找到可安装的 RPM 包"
     fi
 
     # 检查核心包是否存在
     local has_core=false
     for rpm_file in "${ordered_rpms[@]}"; do
-        if basename "$rpm_file" | grep -q "kernel-ml-core"; then
+        local bname
+        bname=$(basename "$rpm_file")
+        if [[ "$bname" == kernel-ml-core-* ]]; then
             has_core=true
             break
         fi
     done
 
     if ! $has_core; then
-        error "缺少核心包 kernel-ml-core，无法继续安装"
-        exit 1
+        die "缺少核心包 kernel-ml-core，无法继续安装"
     fi
 
     if [[ ${#skipped[@]} -gt 0 ]]; then
@@ -508,7 +539,7 @@ install_rpms() {
     local i=1
     for rpm_file in "${ordered_rpms[@]}"; do
         echo -e "  ${CYAN}${i}.${NC} $(basename "$rpm_file")"
-        ((i++))
+        i=$((i + 1))
     done
     echo ""
 
@@ -525,14 +556,12 @@ install_rpms() {
     if command -v dnf &>/dev/null; then
         step "使用 dnf 安装（自动处理依赖）..."
         if ! dnf install -y "${ordered_rpms[@]}"; then
-            error "dnf 安装失败"
-            exit 1
+            die "dnf 安装失败"
         fi
     elif command -v yum &>/dev/null; then
         step "使用 yum 安装（自动处理依赖）..."
         if ! yum localinstall -y "${ordered_rpms[@]}"; then
-            error "yum 安装失败"
-            exit 1
+            die "yum 安装失败"
         fi
     else
         step "使用 rpm 按顺序安装..."
@@ -541,9 +570,7 @@ install_rpms() {
             basename_file=$(basename "$rpm_file")
             echo -e "  安装 ${basename_file}..."
             if ! rpm -ivh "$rpm_file"; then
-                error "安装失败: ${basename_file}"
-                error "尝试: rpm -ivh --nodeps ${basename_file}"
-                exit 1
+                die "安装失败: ${basename_file}，尝试: rpm -ivh --nodeps ${basename_file}"
             fi
         done
     fi
