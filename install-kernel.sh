@@ -201,7 +201,7 @@ get_versions() {
     fi
 
     # 从 GitHub API 获取
-    step "从 GitHub 获取可用版本列表..."
+    step "从 GitHub 获取可用版本列表..." >&2
     versions=$(get_remote_versions) || true
     if [[ -n "$versions" ]]; then
         echo "$versions"
