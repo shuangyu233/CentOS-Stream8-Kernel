@@ -21,7 +21,8 @@ REPO_NAME="CentOS-Stream8-Kernel"
 REPO_BRANCH="main"
 GITHUB_RAW="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
 GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
-ELREPO_DIR="elrepo"
+KERNEL_TRACKS=("ML" "LTS" "Test")
+SELECTED_TRACK="ML"
 TMP_DIR_BASE="/tmp/kernel-ml-install"
 TMP_DIR=""
 TMP_CREATED=0
@@ -214,29 +215,34 @@ get_local_versions() {
     script_dir=$(get_script_dir)
     [[ -z "$script_dir" ]] && return 0
 
-    local elrepo_path="${script_dir}/${ELREPO_DIR}"
-    if [[ -d "$elrepo_path" ]]; then
-        find "$elrepo_path" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort -V || true
-    fi
+    local track output=""
+    for track in "${KERNEL_TRACKS[@]}"; do
+        local track_path="${script_dir}/${track}"
+        if [[ -d "$track_path" ]]; then
+            while IFS= read -r v; do
+                [[ -n "$v" ]] && output+="${track}|${v}"$'\n'
+            done < <(find "$track_path" -mindepth 1 -maxdepth 1 -type d \
+                         -exec basename {} \; 2>/dev/null | sort -V || true)
+        fi
+    done
+    [[ -n "$output" ]] && printf '%s' "$output"
 }
 
-get_remote_versions() {
+# 获取单个轨道的远程版本列表，输出 "track|version" 行
+_fetch_track_versions() {
+    local track="$1"
     local response
     response=$(curl -fsSL \
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
-        "${GITHUB_API}/contents/${ELREPO_DIR}?ref=${REPO_BRANCH}" 2>/dev/null) || {
-        error "无法连接到 GitHub"
-        return 1
-    }
+        "${GITHUB_API}/contents/${track}?ref=${REPO_BRANCH}" 2>/dev/null) || return 1
 
     if echo "$response" | grep -q '"message".*rate limit' 2>/dev/null; then
         error "GitHub API 请求频率超限，请稍后重试"
         return 1
     fi
 
-    # 安全提取版本号：每一步都防止 grep 无匹配导致管道失败
     local versions
     versions=$(echo "$response" \
         | grep '"name"' 2>/dev/null \
@@ -244,12 +250,27 @@ get_remote_versions() {
         | grep -E '^[0-9]+\.' 2>/dev/null \
         | sort -V 2>/dev/null) || true
 
-    if [[ -z "$versions" ]]; then
+    if [[ -n "$versions" ]]; then
+        while IFS= read -r v; do
+            [[ -n "$v" ]] && echo "${track}|${v}"
+        done <<< "$versions"
+    fi
+}
+
+get_remote_versions() {
+    local track found=false
+    for track in "${KERNEL_TRACKS[@]}"; do
+        local track_result
+        track_result=$(_fetch_track_versions "$track") || true
+        if [[ -n "$track_result" ]]; then
+            echo "$track_result"
+            found=true
+        fi
+    done
+    if ! $found; then
         error "从 GitHub 获取版本列表返回为空"
         return 1
     fi
-
-    echo "$versions"
 }
 
 get_versions() {
@@ -280,30 +301,70 @@ select_version() {
     local versions_str
     versions_str=$(get_versions) || die "获取版本列表失败"
 
-    local versions=()
-    while IFS= read -r v; do
-        [[ -n "$v" ]] && versions+=("$v")
+    # 解析 "track|version" 条目
+    local track_versions=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && track_versions+=("$line")
     done <<< "$versions_str"
 
-    if [[ ${#versions[@]} -eq 0 ]]; then
+    if [[ ${#track_versions[@]} -eq 0 ]]; then
         die "没有找到可用的内核版本"
     fi
+
+    # 预取已安装的 kernel-ml-core 版本（可能多个）
+    local installed_versions
+    installed_versions=$(rpm -q --qf '%{VERSION}\n' kernel-ml-core 2>/dev/null | sort -u || true)
+
+    # 当前运行内核：仅取 X.Y.Z 部分
+    local running_full running_version
+    running_full=$(uname -r)
+    running_version="${running_full%%-*}"
 
     echo ""
     echo -e "${BLUE}===========================================${NC}"
     echo -e "${BLUE}   CentOS Stream 8 - Kernel ML 安装工具    ${NC}"
     echo -e "${BLUE}===========================================${NC}"
     echo ""
-    echo -e "当前系统内核: ${CYAN}$(uname -r)${NC}"
+    echo -e "当前系统内核: ${CYAN}${running_full}${NC}"
     echo ""
     echo "可用的内核版本:"
     echo ""
 
     local i=1
-    for v in "${versions[@]}"; do
-        echo -e "  ${GREEN}${i})${NC} kernel-ml-${v}"
+    for tv in "${track_versions[@]}"; do
+        local track="${tv%%|*}"
+        local version="${tv##*|}"
+
+        # 轨道标签与颜色
+        local badge badge_color
+        case "$track" in
+            ML)     badge="[ML  ]"; badge_color="${CYAN}"   ;;
+            LTS)    badge="[LTS ]"; badge_color="${YELLOW}" ;;
+            Test)   badge="[Test]"; badge_color="${RED}"    ;;
+            *)      badge="[?   ]"; badge_color="${NC}"     ;;
+        esac
+
+        # 已安装标记
+        local status_str=""
+        if echo "$installed_versions" | grep -qx "$version" 2>/dev/null; then
+            status_str="  ${GREEN}✓ 已安装${NC}"
+        fi
+
+        # 当前运行标记
+        local running_str=""
+        if [[ "$version" == "$running_version" ]]; then
+            running_str="  ${BLUE}← 当前运行${NC}"
+        fi
+
+        echo -e "  ${GREEN}${i})${NC}  ${badge_color}${badge}${NC}  kernel-ml-${version}${status_str}${running_str}"
         i=$((i + 1))
     done
+    echo ""
+
+    # 轨道说明
+    echo -e "  ${CYAN}[ML  ]${NC} MainLine — ELRepo 主线内核（最新特性）"
+    echo -e "  ${YELLOW}[LTS ]${NC} LTS      — 长期支持内核（稳定优先）"
+    echo -e "  ${RED}[Test]${NC} Test     — 测试版本（请勿用于生产环境）"
     echo ""
 
     # 重试循环：输入无效时重新提示（最多 5 次）
@@ -316,21 +377,30 @@ select_version() {
         fi
 
         local choice
-        choice=$(prompt_read "请选择版本 [1-${#versions[@]}]: ")
+        choice=$(prompt_read "请选择版本 [1-${#track_versions[@]}]: ")
 
         # 无终端输入时默认选最新版本
         if [[ -z "$choice" ]]; then
-            choice="${#versions[@]}"
+            choice="${#track_versions[@]}"
             warn "无法读取输入，自动选择最新版本"
         fi
 
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#versions[@]} ]]; then
-            SELECTED_VERSION="${versions[$((choice - 1))]}"
-            info "已选择版本: kernel-ml-${SELECTED_VERSION}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#track_versions[@]} ]]; then
+            local selected="${track_versions[$((choice - 1))]}"
+            SELECTED_TRACK="${selected%%|*}"
+            SELECTED_VERSION="${selected##*|}"
+            local track_label
+            case "$SELECTED_TRACK" in
+                ML)   track_label="MainLine(ML)" ;;
+                LTS)  track_label="LTS"          ;;
+                Test) track_label="Test"         ;;
+                *)    track_label="$SELECTED_TRACK" ;;
+            esac
+            info "已选择: [${track_label}] kernel-ml-${SELECTED_VERSION}"
             return 0
         fi
 
-        warn "无效的选择: ${choice}，请输入 1 到 ${#versions[@]} 之间的数字"
+        warn "无效的选择: ${choice}，请输入 1 到 ${#track_versions[@]} 之间的数字"
     done
 }
 
@@ -342,7 +412,7 @@ prepare_rpms() {
     local script_dir
     script_dir=$(get_script_dir)
     if [[ -n "$script_dir" ]]; then
-        local local_path="${script_dir}/${ELREPO_DIR}/${version}"
+        local local_path="${script_dir}/${SELECTED_TRACK}/${version}"
         if [[ -d "$local_path" ]] && ls "$local_path"/*.rpm &>/dev/null; then
             info "使用本地 RPM 包: ${local_path}"
             RPM_DIR="$local_path"
@@ -362,7 +432,7 @@ prepare_rpms() {
         --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
         --max-time 30 \
         --retry "${CURL_RETRY}" \
-        "${GITHUB_API}/contents/${ELREPO_DIR}/${version}?ref=${REPO_BRANCH}" 2>/dev/null) || {
+        "${GITHUB_API}/contents/${SELECTED_TRACK}/${version}?ref=${REPO_BRANCH}" 2>/dev/null) || {
         die "无法连接到 GitHub，请检查网络"
     }
 
@@ -393,7 +463,7 @@ prepare_rpms() {
                 if [[ -n "$files" ]]; then
                     files="${files}"$'\n'
                 fi
-                files="${files}${GITHUB_RAW}/${ELREPO_DIR}/${version}/${name}"
+                files="${files}${GITHUB_RAW}/${SELECTED_TRACK}/${version}/${name}"
             done <<< "$names"
         fi
     fi
@@ -431,7 +501,7 @@ prepare_rpms() {
     info "所有 RPM 包下载完成 (共 ${count} 个)"
 
     # 下载 SHA256SUMS 校验文件
-    local sha256_url="${GITHUB_RAW}/${ELREPO_DIR}/${version}/SHA256SUMS"
+    local sha256_url="${GITHUB_RAW}/${SELECTED_TRACK}/${version}/SHA256SUMS"
     echo -e "  下载 SHA256SUMS..."
     if curl -fsSL \
             --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
@@ -749,7 +819,8 @@ main() {
             exit 1
         fi
         SELECTED_VERSION="$version"
-        info "指定版本: kernel-ml-${SELECTED_VERSION}"
+        SELECTED_TRACK="ML"   # 命令行指定版本时默认使用 ML (MainLine) 轨道
+        info "指定版本: kernel-ml-${SELECTED_VERSION} (轨道: ${SELECTED_TRACK})"
     else
         # 交互式选择
         select_version
