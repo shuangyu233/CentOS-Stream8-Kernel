@@ -311,14 +311,22 @@ select_version() {
         die "没有找到可用的内核版本"
     fi
 
-    # 预取已安装的 kernel-ml-core 版本（可能多个）
-    local installed_versions
-    installed_versions=$(rpm -q --qf '%{VERSION}\n' kernel-ml-core 2>/dev/null | sort -u || true)
+    # 预取已安装的 kernel-ml-core 信息（版本|发行号），用于精确匹配轨道
+    # ML 内核 release 含 "elrepo"，部分 Test 含 "yunyoo"，无标识时排除 ML
+    local installed_info
+    installed_info=$(rpm -q --qf '%{VERSION}|%{RELEASE}\n' kernel-ml-core 2>/dev/null \
+                     | grep -E '^[0-9]' || true)
 
-    # 当前运行内核：仅取 X.Y.Z 部分
-    local running_full running_version
+    # 当前运行内核及所属轨道
+    local running_full running_version running_track
     running_full=$(uname -r)
     running_version="${running_full%%-*}"
+    running_track=""
+    if [[ "$running_full" == *elrepo* ]]; then
+        running_track="ML"
+    elif [[ "$running_full" == *yunyoo* ]]; then
+        running_track="Test"
+    fi
 
     echo ""
     echo -e "${BLUE}===========================================${NC}"
@@ -344,16 +352,31 @@ select_version() {
             *)      badge="[?   ]"; badge_color="${NC}"     ;;
         esac
 
-        # 已安装标记
+        # 已安装标记：匹配版本号和轨道
         local status_str=""
-        if echo "$installed_versions" | grep -qx "$version" 2>/dev/null; then
-            status_str="  ${GREEN}✓ 已安装${NC}"
+        if [[ -n "$installed_info" ]]; then
+            local _inst_ver _inst_rel _inst_track
+            while IFS='|' read -r _inst_ver _inst_rel; do
+                [[ "$_inst_ver" != "$version" ]] && continue
+                _inst_track=""
+                [[ "$_inst_rel" == *elrepo* ]] && _inst_track="ML"
+                [[ "$_inst_rel" == *yunyoo* ]] && _inst_track="Test"
+                # 有标识则精确匹配轨道，无标识时排除 ML（ML release 必含 elrepo）
+                if [[ -n "$_inst_track" && "$_inst_track" == "$track" ]] \
+                   || [[ -z "$_inst_track" && "$track" != "ML" ]]; then
+                    status_str="  ${GREEN}✓ 已安装${NC}"
+                    break
+                fi
+            done <<< "$installed_info"
         fi
 
-        # 当前运行标记
+        # 当前运行标记：匹配版本号和轨道
         local running_str=""
         if [[ "$version" == "$running_version" ]]; then
-            running_str="  ${BLUE}← 当前运行${NC}"
+            if [[ -n "$running_track" && "$running_track" == "$track" ]] \
+               || [[ -z "$running_track" && "$track" != "ML" ]]; then
+                running_str="  ${BLUE}← 当前运行${NC}"
+            fi
         fi
 
         echo -e "  ${GREEN}${i})${NC}  ${badge_color}${badge}${NC}  kernel-ml-${version}${status_str}${running_str}"
